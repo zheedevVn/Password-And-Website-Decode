@@ -1,0 +1,17 @@
+// file: package.json
+{
+  "name": "vercel-login-extractor",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Vercel Serverless Chrome Login Data Extractor (Web UI + REST API)",
+  "main": "api/index.js",
+  "scripts": {
+    "start": "node api/index.js"
+  },
+  "dependencies": {
+    "sql.js": "^1.12.0"
+  },
+  "engines": {
+    "node": ">=18.x"
+  }
+}

@@ -1,14 +1,18 @@
-// file: vercel.json
 {
   "version": 2,
   "rewrites": [
-    { "source": "/api/(.*)", "destination": "/api/index.js" },
-    { "source": "/", "destination": "/api/index.js" },
+    {
+      "source": "/api/(.*)",
+      "destination": "/api/index.js"
+    },
+    {
+      "source": "/",
+      "destination": "/api/index.js"
+    }
   ],
   "functions": {
     "api/index.js": {
-      "maxDuration": 60,
-      "memory": 1024
+      "includeFiles": "node_modules/sql.js/dist/sql-wasm.wasm"
     }
   }
 }

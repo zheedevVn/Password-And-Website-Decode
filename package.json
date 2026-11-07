@@ -1,8 +1,8 @@
 {
   "name": "vercel-login-extractor",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "private": true,
-  "description": "Vercel Serverless Chrome Login Data Extractor",
+  "description": "Vercel Serverless Chromium Login Data Extractor (Chrome / Edge / Brave / Opera)",
   "main": "api/index.js",
   "scripts": {
     "start": "node api/index.js"

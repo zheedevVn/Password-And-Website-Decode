@@ -1,6 +1,6 @@
 // file: api/index.js
 // runtime: Vercel Serverless Node.js 18+ / 20+ / 22+
-// env: EXTRACTOR_API_KEY (default: "ollie-secret-key-6767")
+// env: EXTRACTOR_API_KEY (REQUIRED — no default; /api/extract returns 503 when unset)
 
 const crypto = require('node:crypto');
 const http = require('node:http');
@@ -8,7 +8,33 @@ const path = require('node:path');
 const fs = require('node:fs');
 const initSqlJs = require('sql.js');
 
-const DEFAULT_API_KEY = process.env.EXTRACTOR_API_KEY || 'hoducminh';
+const API_KEY = process.env.EXTRACTOR_API_KEY || '';
+const MAX_BODY_BYTES = 32 * 1024 * 1024; // hard cap for the raw request body
+const MAX_SQLITE_BYTES = 25 * 1024 * 1024; // hard cap for the decoded Login Data file
+
+function keyMatches(clientKey) {
+    if (!API_KEY || !clientKey || typeof clientKey !== 'string') return false;
+    const a = Buffer.from(clientKey, 'utf8');
+    const b = Buffer.from(API_KEY, 'utf8');
+    if (a.length !== b.length) return false;
+    return crypto.timingSafeEqual(a, b);
+}
+
+// Best-effort per-IP rate limit (per serverless instance)
+const RATE_WINDOW_MS = 60 * 1000;
+const RATE_MAX_PER_WINDOW = 20;
+const rateBuckets = new Map();
+function isRateLimited(ip) {
+    const now = Date.now();
+    let bucket = rateBuckets.get(ip);
+    if (!bucket || now - bucket.start >= RATE_WINDOW_MS) {
+        bucket = { start: now, count: 0 };
+        rateBuckets.set(ip, bucket);
+    }
+    bucket.count += 1;
+    if (rateBuckets.size > 5000) rateBuckets.clear();
+    return bucket.count > RATE_MAX_PER_WINDOW;
+}
 
 // ---------------------------------------------------------------------------
 // CHROME ELEVATION SERVICE CONSTANTS (v127 -> v135+)
@@ -290,12 +316,27 @@ function formatTxtOutput(records) {
     );
 }
 
+function csvEscape(value) {
+    const text = String(value ?? '');
+    return /[",\n\r]/.test(text) ? '"' + text.replace(/"/g, '""') + '"' : text;
+}
+
+function formatCsvOutput(records) {
+    const header = 'origin_url,username,password,encryption_version,times_used';
+    const rows = records.map((r) =>
+        [r.origin_url, r.username_value, r.password_plaintext, r.encryption_version, r.times_used]
+            .map(csvEscape)
+            .join(',')
+    );
+    return header + '\n' + rows.join('\n') + '\n';
+}
+
 const WEB_UI_HTML = `<!DOCTYPE html>
 <html lang="vi">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Chrome Login Data Extractor — Vercel API & Web UI</title>
+<title>Chromium Login Data Extractor — Chrome / Edge / Brave / Opera</title>
 <style>
   :root { --bg:#0b0f17; --card:#151b26; --border:#2a3447; --accent:#3b82f6; --text:#e2e8f0; --muted:#94a3b8; }
   body { background:var(--bg); color:var(--text); font-family:ui-monospace,SFMono-Regular,Consolas,monospace; margin:0; padding:24px; }
@@ -323,33 +364,34 @@ const WEB_UI_HTML = `<!DOCTYPE html>
 <body>
 <div class="container">
   <div class="card">
-    <h1>CHROME LOGIN DATA EXTRACTOR (VERCEL STABLE)</h1>
+    <h1>GIAI MA LOGIN DATA — CHROME / EDGE / BRAVE / OPERA (v2.0.0)</h1>
     <div class="warn-box">
-      <strong>Huong dan:</strong> Chon file <code>Login Data</code> va nhap <code>v20 Master Key (64-hex)</code> de giai ma mat khau thanh cong 100%.
+      <strong>Hướng dẫn:</strong> Chọn file <code>Login Data</code> của Chrome / Edge / Brave / Opera / Vivaldi (cùng định dạng SQLite) và nhập <code>v20 Master Key (64 ký tự hex)</code> lấy từ file <code>Local State</code> để giải mã mật khẩu. API key là giá trị <code>EXTRACTOR_API_KEY</code> đã set trên Vercel.
     </div>
     <form id="extractForm">
       <div class="grid">
         <div class="field">
           <label>API Key (Header: x-api-key) *</label>
-          <input type="password" id="apiKey" value="ollie-secret-key-6767" required />
+          <input type="password" id="apiKey" placeholder="EXTRACTOR_API_KEY đã set trên Vercel" required />
         </div>
         <div class="field">
           <label>File "Login Data" (SQLite) *</label>
           <input type="file" id="loginFile" required />
         </div>
         <div class="field">
-          <label>v20 Master Key (64 ky tu hex)</label>
+          <label>v20 Master Key (64 ký tự hex)</label>
           <input type="text" id="v20Key" placeholder="64 ky tu hex v20 Key" />
         </div>
         <div class="field">
-          <label>v10 Master Key (64 ky tu hex)</label>
+          <label>v10 Master Key (64 ký tự hex)</label>
           <input type="text" id="v10Key" placeholder="64 ky tu hex v10 Key" />
         </div>
       </div>
       <div class="btns">
-        <button type="submit">1. Giai Ma & Xem Truc Tiep</button>
-        <button type="button" class="secondary" id="btnDownloadTxt">2. Gui API & Tai Thang File .TXT</button>
-        <button type="button" class="secondary" id="btnDownloadJson">3. Gui API & Tai Thang File .JSON</button>
+        <button type="submit">1. Giải Mã & Xem Trực Tiếp</button>
+        <button type="button" class="secondary" id="btnDownloadTxt">2. Gửi API & Tải File .TXT</button>
+        <button type="button" class="secondary" id="btnDownloadJson">3. Gửi API & Tải File .JSON</button>
+        <button type="button" class="secondary" id="btnDownloadCsv">4. Gửi API & Tải File .CSV</button>
       </div>
     </form>
     <div id="status" style="margin-top:14px;color:#94a3b8;font-size:13px;"></div>
@@ -380,11 +422,11 @@ async function callApi(outputFormat) {
   const tableWrap = document.getElementById('tableWrap');
 
   if (!apiKey || !fileInput) {
-    statusEl.textContent = '[!] Vui long nhap API Key va chon file Login Data.';
+    statusEl.textContent = '[!] Vui lòng nhập API Key và chọn file Login Data.';
     return;
   }
 
-  statusEl.textContent = 'Dang gui file Login Data len API endpoint...';
+  statusEl.textContent = 'Đang gửi file Login Data lên API endpoint...';
   const loginB64 = await fileToB64(fileInput);
 
   const resp = await fetch('/api/extract?output=' + encodeURIComponent(outputFormat), {
@@ -407,22 +449,22 @@ async function callApi(outputFormat) {
     return;
   }
 
-  if (outputFormat === 'txt_file' || outputFormat === 'json_file') {
+  if (outputFormat === 'txt_file' || outputFormat === 'json_file' || outputFormat === 'csv_file') {
     const blob = await resp.blob();
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = outputFormat === 'txt_file' ? 'decrypted_accounts.txt' : 'decrypted_logins.json';
+    a.download = outputFormat === 'txt_file' ? 'decrypted_accounts.txt' : (outputFormat === 'csv_file' ? 'decrypted_logins.csv' : 'decrypted_logins.json');
     document.body.appendChild(a);
     a.click();
     a.remove();
     URL.revokeObjectURL(url);
-    statusEl.textContent = '[+] Da nhan va tai file trich xuat tu API thanh cong!';
+    statusEl.textContent = '[+] Đã nhận và tải file trích xuất từ API thành công!';
     return;
   }
 
   const data = await resp.json();
-  statusEl.textContent = '[+] Tong: ' + data.total + ' tai khoan | Giai ma thanh cong: ' + data.decrypted_count + '/' + data.total;
+  statusEl.textContent = '[+] Tổng: ' + data.total + ' tài khoản | Giải mã thành công: ' + data.decrypted_count + '/' + data.total;
   let html = '<table><thead><tr><th>#</th><th>Origin URL</th><th>Username</th><th>Password</th><th>Ver</th></tr></thead><tbody>';
   data.records.forEach((r, i) => {
     const passClass = r.decrypted_ok ? 'pass-ok' : 'pass-err';
@@ -444,21 +486,41 @@ document.getElementById('extractForm').addEventListener('submit', (e) => {
 });
 document.getElementById('btnDownloadTxt').addEventListener('click', () => callApi('txt_file'));
 document.getElementById('btnDownloadJson').addEventListener('click', () => callApi('json_file'));
+document.getElementById('btnDownloadCsv').addEventListener('click', () => callApi('csv_file'));
 </script>
 </body>
 </html>`;
 
-function readRequestBuffer(req) {
+function readRequestBuffer(req, maxBytes) {
     return new Promise((resolve, reject) => {
         const chunks = [];
-        req.on('data', (c) => chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c)));
+        let total = 0;
+        req.on('data', (c) => {
+            const buf = Buffer.isBuffer(c) ? c : Buffer.from(c);
+            total += buf.length;
+            if (total > maxBytes) {
+                reject(new Error('PAYLOAD_TOO_LARGE'));
+                req.destroy();
+                return;
+            }
+            chunks.push(buf);
+        });
         req.on('end', () => resolve(Buffer.concat(chunks)));
         req.on('error', reject);
     });
 }
 
 async function handler(req, res) {
-    res.setHeader('Access-Control-Allow-Origin', '*');
+    // CORS: only this site's own origin may call the API from a browser
+    const reqOrigin = req.headers.origin;
+    if (reqOrigin) {
+        try {
+            if (new URL(reqOrigin).host === req.headers.host) {
+                res.setHeader('Access-Control-Allow-Origin', reqOrigin);
+                res.setHeader('Vary', 'Origin');
+            }
+        } catch {}
+    }
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-api-key, x-v10-key, x-v20-key');
 
@@ -475,18 +537,29 @@ async function handler(req, res) {
     }
 
     if (req.method === 'POST' && parsedUrl.pathname.startsWith('/api/extract')) {
+        if (!API_KEY) {
+            res.writeHead(503, { 'Content-Type': 'application/json; charset=utf-8' });
+            return res.end(JSON.stringify({ ok: false, error: 'Server is not configured: EXTRACTOR_API_KEY is missing' }));
+        }
+
+        const clientIp = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim() || (req.socket && req.socket.remoteAddress) || 'unknown';
+        if (isRateLimited(clientIp)) {
+            res.writeHead(429, { 'Content-Type': 'application/json; charset=utf-8' });
+            return res.end(JSON.stringify({ ok: false, error: 'Too many requests — try again in a minute' }));
+        }
+
         const clientKey =
             req.headers['x-api-key'] ||
             parsedUrl.searchParams.get('api_key') ||
             parsedUrl.searchParams.get('apikey');
 
-        if (clientKey !== DEFAULT_API_KEY) {
+        if (!keyMatches(clientKey)) {
             res.writeHead(401, { 'Content-Type': 'application/json; charset=utf-8' });
             return res.end(JSON.stringify({ ok: false, error: 'Invalid or missing x-api-key' }));
         }
 
         try {
-            const rawBody = await readRequestBuffer(req);
+            const rawBody = await readRequestBuffer(req, MAX_BODY_BYTES);
             const contentType = (req.headers['content-type'] || '').toLowerCase();
 
             let sqliteBuffer = null;
@@ -510,6 +583,12 @@ async function handler(req, res) {
             if (!sqliteBuffer || sqliteBuffer.length < 100) {
                 throw new Error('Invalid or empty SQLite Login Data file');
             }
+            if (sqliteBuffer.length > MAX_SQLITE_BYTES) {
+                throw new Error('PAYLOAD_TOO_LARGE');
+            }
+            if (sqliteBuffer.subarray(0, 15).toString('latin1') !== 'SQLite format 3') {
+                throw new Error('Uploaded file is not a valid SQLite Login Data file');
+            }
 
             const candidateKeys = [
                 ...parseKeyCandidates(v20Raw),
@@ -525,6 +604,15 @@ async function handler(req, res) {
                     'Content-Disposition': 'attachment; filename="decrypted_accounts.txt"',
                 });
                 return res.end(txtPayload);
+            }
+
+            if (outputMode === 'csv' || outputMode === 'csv_file') {
+                const csvPayload = formatCsvOutput(records);
+                res.writeHead(200, {
+                    'Content-Type': 'text/csv; charset=utf-8',
+                    'Content-Disposition': 'attachment; filename="decrypted_logins.csv"',
+                });
+                return res.end(csvPayload);
             }
 
             if (outputMode === 'json_file') {
@@ -548,8 +636,20 @@ async function handler(req, res) {
                 })
             );
         } catch (err) {
+            if (err && err.message === 'PAYLOAD_TOO_LARGE') {
+                res.writeHead(413, { 'Content-Type': 'application/json; charset=utf-8' });
+                return res.end(JSON.stringify({ ok: false, error: 'Uploaded file is too large (max 25MB Login Data / 32MB request body)' }));
+            }
+            const knownErrors = [
+                'Missing login_data_b64 in JSON payload',
+                'Invalid or empty SQLite Login Data file',
+                'Uploaded file is not a valid SQLite Login Data file',
+            ];
+            const message = knownErrors.includes(err && err.message)
+                ? err.message
+                : 'Could not process the Login Data file (corrupt or unsupported format)';
             res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
-            return res.end(JSON.stringify({ ok: false, error: err.message }));
+            return res.end(JSON.stringify({ ok: false, error: message }));
         }
     }
 
